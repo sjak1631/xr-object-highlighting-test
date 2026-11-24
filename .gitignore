@@ -1,0 +1,5 @@
+# Python
+server/.venv/
+__pycache__/
+*.pt
+*.onnx
