@@ -14,6 +14,11 @@ import kotlin.math.min
  * XREAL Aura is an optical see-through (additive) display: black is transparent, so we only draw
  * bright strokes and a faint tint and keep everything else transparent.
  */
+enum class MarkerStyle { PIN, BOX }
+
+/** Height of the pin's label chip relative to the panel width (see HighlightController). */
+const val PIN_CHIP_RATIO = 0.2f
+
 class HighlightView(context: Context) : View(context) {
     private var label = ""
     private var score = 0f
@@ -34,10 +39,13 @@ class HighlightView(context: Context) : View(context) {
         setBackgroundColor(Color.TRANSPARENT)
     }
 
-    fun bind(label: String, score: Float) {
-        if (label == this.label && kotlin.math.abs(score - this.score) < 0.02f) return
+    private var markerStyle = MarkerStyle.PIN
+
+    fun bind(label: String, score: Float, style: MarkerStyle = markerStyle) {
+        if (label == this.label && style == markerStyle && kotlin.math.abs(score - this.score) < 0.02f) return
         this.label = label
         this.score = score
+        this.markerStyle = style
         this.color = labelColor(label)
         invalidate()
     }
@@ -46,6 +54,58 @@ class HighlightView(context: Context) : View(context) {
         val w = width.toFloat()
         val h = height.toFloat()
         if (w <= 0f || h <= 0f) return
+        if (markerStyle == MarkerStyle.PIN) drawPin(canvas, w, h) else drawBox(canvas, w, h)
+    }
+
+    /**
+     * Game-style marker: label chip at the top, a vertical leader line, and a ring at the bottom
+     * edge of the panel, which is placed exactly on the object. Only that one point has to land on
+     * the object, so it tolerates position/size errors much better than a bounding box.
+     *
+     * Geometry contract with [HighlightController]: the chip is [PIN_CHIP_RATIO] * width tall.
+     */
+    private fun drawPin(canvas: Canvas, w: Float, h: Float) {
+        val chipH = w * PIN_CHIP_RATIO
+        val cx = w / 2f
+        val ringR = w * 0.035f
+        val lineW = w * 0.012f
+
+        // Label chip (centered, auto-width)
+        text.textSize = chipH * 0.62f
+        val caption = label
+        val pad = chipH * 0.35f
+        val chipW = min(text.measureText(caption) + 2 * pad, w)
+        val r = chipH * 0.5f
+        chip.color = color
+        rect.set(cx - chipW / 2, 0f, cx + chipW / 2, chipH)
+        glow.color = withAlpha(color, 70)
+        glow.strokeWidth = lineW * 3f
+        canvas.drawRoundRect(rect, r, r, glow)
+        canvas.drawRoundRect(rect, r, r, chip)
+        canvas.drawText(caption, rect.left + pad, chipH / 2 - (text.descent() + text.ascent()) / 2, text)
+
+        // Leader line
+        val lineTop = chipH
+        val lineBottom = h - ringR * 2f
+        if (lineBottom > lineTop) {
+            glow.strokeWidth = lineW * 3f
+            canvas.drawLine(cx, lineTop, cx, lineBottom, glow)
+            stroke.color = color
+            stroke.strokeWidth = lineW
+            canvas.drawLine(cx, lineTop, cx, lineBottom, stroke)
+        }
+
+        // Target ring on the object
+        val ringY = h - ringR - lineW
+        glow.strokeWidth = lineW * 3f
+        canvas.drawCircle(cx, ringY, ringR, glow)
+        stroke.strokeWidth = lineW * 1.5f
+        canvas.drawCircle(cx, ringY, ringR, stroke)
+        fill.color = color
+        canvas.drawCircle(cx, ringY, ringR * 0.35f, fill)
+    }
+
+    private fun drawBox(canvas: Canvas, w: Float, h: Float) {
         val base = min(w, h)
         val sw = (base * 0.025f).coerceIn(2f * density, 8f * density)
         val inset = sw * 2.5f

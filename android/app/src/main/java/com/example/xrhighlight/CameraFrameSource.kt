@@ -20,6 +20,9 @@ import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleOwner
 import androidx.xr.runtime.math.Pose
+import androidx.xr.runtime.math.Vector3
+import org.json.JSONArray
+import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.Executors
 import kotlin.math.atan
@@ -36,8 +39,8 @@ class CameraFrameSource(
     private val context: Context,
     private val lifecycleOwner: LifecycleOwner,
     private val client: DetectionClient,
-    /** Current head pose in perception space, or null if tracking is not available right now. */
-    private val headPoseProvider: () -> Pose?,
+    /** Head pose history (perception space); null = no XR tracking (2D test mode). */
+    private val poseHistory: PoseHistory?,
     private val onFrameSent: (FrameMeta) -> Unit,
     private val maxWidth: Int = 640,
     private val jpegQuality: Int = 75,
@@ -145,11 +148,13 @@ class CameraFrameSource(
     private fun analyze(image: ImageProxy) {
         try {
             if (!client.tryAcquireSlot()) return
-            val pose = headPoseProvider()
+            val imageTimeNs = image.imageInfo.timestamp
+            val pose = if (poseHistory == null) Pose.Identity else poseHistory.poseAt(imageTimeNs)
             if (pose == null) {
                 client.releaseSlot()
                 return
             }
+            val angVel = poseHistory?.angularVelocity(imageTimeNs) ?: Vector3.Zero
             val rotation = image.imageInfo.rotationDegrees
             var bmp = image.toBitmap()
             val longSide = max(bmp.width, bmp.height)
@@ -169,12 +174,18 @@ class CameraFrameSource(
             onFrameSent(
                 FrameMeta(
                     frameId = id,
+                    imageTimeNs = imageTimeNs,
                     headPose = pose,
                     camera = cameraModelFor(bmp.width, bmp.height, rotation),
                     sentAtMs = SystemClock.elapsedRealtime(),
                 )
             )
-            client.sendFrame(id, jpeg)
+            val header = JSONObject()
+                .put("ts", imageTimeNs)
+                .put("q", JSONArray(listOf(pose.rotation.x, pose.rotation.y, pose.rotation.z, pose.rotation.w).map { it.toDouble() }))
+                .put("p", JSONArray(listOf(pose.translation.x, pose.translation.y, pose.translation.z).map { it.toDouble() }))
+                .put("w", JSONArray(listOf(angVel.x, angVel.y, angVel.z).map { it.toDouble() }))
+            client.sendFrame(id, header, jpeg)
         } catch (e: Exception) {
             Log.w(TAG, "analyze failed", e)
             client.releaseSlot()

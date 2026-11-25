@@ -4,13 +4,20 @@ Protocol (one WebSocket connection per client, path /ws):
 
 client -> server
   text   {"type": "config", "labels": ["cup", "bottle"], "conf": 0.25}
-  binary 8-byte big-endian frame id + JPEG bytes
+  binary 8-byte big-endian frame id + JPEG bytes, or
+         8-byte frame id + 4-byte header length + JSON header + JPEG, where the header is
+         {"ts": ns, "q": [x,y,z,w], "p": [x,y,z], "w": [wx,wy,wz]} = head pose at exposure
+         (perception/world frame) and world angular velocity; enables auto calibration
+  text   {"type": "calib_reset"}
 
 server -> client
   text   {"type": "config_ack", "labels": [...]}
   text   {"type": "detections", "frame_id": 123, "infer_ms": 18.2,
           "width": 640, "height": 480,
           "detections": [{"label": "cup", "score": 0.81, "box": [x1, y1, x2, y2]}]}
+  text   {"type": "calibration", "q": [...], "tan_h": .., "tan_v": .., "cx": .., "cy": ..,
+          "dt_ms": .., "rms_px": .., "pairs": .., "quality": .., "converged": true}
+          (see calibration.py)
 
 Boxes are normalized to [0, 1]. The client is expected to send the next frame
 only after receiving the result of the previous one (stop-and-wait), which
@@ -31,9 +38,20 @@ import numpy as np
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
+from calibration import AutoCalibrator
 from detector import OpenVocabDetector
 
 log = logging.getLogger("server")
+
+
+def parse_frame(payload: bytes) -> tuple[int, dict | None, bytes]:
+    """[int64 frame_id][JPEG]  or  [int64 frame_id][uint32 header_len][JSON header][JPEG]."""
+    (frame_id,) = struct.unpack(">q", payload[:8])
+    if payload[8:10] == bytes((0xFF, 0xD8)):  # JPEG SOI right after the id: no header
+        return frame_id, None, payload[8:]
+    (hlen,) = struct.unpack(">I", payload[8:12])
+    header = json.loads(payload[12 : 12 + hlen].decode("utf-8"))
+    return frame_id, header, payload[12 + hlen :]
 
 
 def build_app(detector: OpenVocabDetector, default_labels: list[str]) -> FastAPI:
@@ -58,6 +76,7 @@ def build_app(detector: OpenVocabDetector, default_labels: list[str]) -> FastAPI
         conf = 0.25
         labels: list[str] = list(detector.labels)
         loop = asyncio.get_running_loop()
+        calibrator = AutoCalibrator()
         try:
             while True:
                 msg = await ws.receive()
@@ -72,13 +91,16 @@ def build_app(detector: OpenVocabDetector, default_labels: list[str]) -> FastAPI
                         await ws.send_text(
                             json.dumps({"type": "config_ack", "labels": list(detector.labels)})
                         )
+                    elif data.get("type") == "calib_reset":
+                        calibrator.reset()
+                        log.info("calibration reset by client")
                     continue
 
                 payload = msg.get("bytes")
                 if not payload or len(payload) < 9:
                     continue
-                (frame_id,) = struct.unpack(">q", payload[:8])
-                img = cv2.imdecode(np.frombuffer(payload[8:], np.uint8), cv2.IMREAD_COLOR)
+                frame_id, header, jpeg = parse_frame(payload)
+                img = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
                 if img is None:
                     continue
                 # Several clients may share one detector with different labels.
@@ -99,6 +121,11 @@ def build_app(detector: OpenVocabDetector, default_labels: list[str]) -> FastAPI
                         }
                     )
                 )
+                # Auto calibration runs on the same frames (after the result was sent).
+                if header and "q" in header:
+                    await loop.run_in_executor(None, calibrator.add_frame, img, header)
+                if (calib := calibrator.pop_result()) is not None:
+                    await ws.send_text(json.dumps(calib))
         except WebSocketDisconnect:
             pass
         finally:

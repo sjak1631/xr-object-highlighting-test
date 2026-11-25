@@ -11,9 +11,10 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
-import androidx.lifecycle.Lifecycle
+import android.view.Choreographer
+import androidx.lifecycle.DefaultLifecycleObserver
+import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.lifecycleScope
-import androidx.lifecycle.repeatOnLifecycle
 import androidx.xr.runtime.Config
 import androidx.xr.runtime.DepthEstimationMode
 import androidx.xr.runtime.DeviceTrackingMode
@@ -21,12 +22,11 @@ import androidx.xr.runtime.PlaneTrackingMode
 import androidx.xr.runtime.Session
 import androidx.xr.runtime.SessionConfigureSuccess
 import androidx.xr.runtime.SessionCreateSuccess
-import androidx.xr.runtime.math.Pose
+import androidx.xr.arcore.ArDevice
+import androidx.xr.arcore.TrackingState
 import androidx.xr.scenecore.SpatialCapability
 import androidx.xr.scenecore.scene
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.util.concurrent.ConcurrentHashMap
 
@@ -36,6 +36,17 @@ class MainActivity : ComponentActivity() {
     private var camera: CameraFrameSource? = null
     private var session: Session? = null
     private var highlights: HighlightController? = null
+    private val poseHistory = PoseHistory()
+    private var ticking = false
+    private val frameCallback = object : Choreographer.FrameCallback {
+        override fun doFrame(frameTimeNanos: Long) {
+            highlights?.let {
+                it.tick()
+                if (state.visibleHighlights != it.trackCount) state.visibleHighlights = it.trackCount
+            }
+            if (ticking) Choreographer.getInstance().postFrameCallback(this)
+        }
+    }
     private val pendingFrames = ConcurrentHashMap<Long, FrameMeta>()
     private var lastResultAt = 0L
 
@@ -72,6 +83,7 @@ class MainActivity : ComponentActivity() {
                     state.connectionMessage = msg
                 }
             },
+            onCalibration = { calib -> lifecycleScope.launch(Dispatchers.Main) { handleCalibration(calib) } },
         )
 
         setContent {
@@ -82,6 +94,11 @@ class MainActivity : ComponentActivity() {
                 onVoiceInput = ::startVoiceInput,
                 onClearHighlights = { highlights?.clear() },
                 onTestPanel = { highlights?.showTestPanel() },
+                onResetAutoCalibration = {
+                    state.autoCalibration = null
+                    client.resetCalibration()
+                    highlights?.clear()
+                },
             )
         }
 
@@ -96,18 +113,18 @@ class MainActivity : ComponentActivity() {
         }
         if (missing.isEmpty()) initXr() else permissionLauncher.launch(missing.toTypedArray())
 
-        // Re-orient / resize highlight panels every frame while visible.
-        lifecycleScope.launch {
-            repeatOnLifecycle(Lifecycle.State.STARTED) {
-                while (isActive) {
-                    highlights?.let {
-                        it.tick()
-                        state.visibleHighlights = it.trackCount
-                    }
-                    delay(16)
-                }
+        // Animate highlight panels on every display frame while the activity is started.
+        lifecycle.addObserver(object : DefaultLifecycleObserver {
+            override fun onStart(owner: LifecycleOwner) {
+                ticking = true
+                Choreographer.getInstance().postFrameCallback(frameCallback)
             }
-        }
+
+            override fun onStop(owner: LifecycleOwner) {
+                ticking = false
+                Choreographer.getInstance().removeFrameCallback(frameCallback)
+            }
+        })
     }
 
     private fun initXr() {
@@ -124,7 +141,22 @@ class MainActivity : ComponentActivity() {
                     updateXrStatus()
                     // Only honoured while the activity has focus; also retried in onWindowFocusChanged.
                     requestFullSpace()
-                    highlights = HighlightController(this@MainActivity, s) { state.calibration }
+                    highlights = HighlightController(
+                        context = this@MainActivity,
+                        session = s,
+                        poseHistory = poseHistory,
+                        calibration = { state.calibration },
+                        autoCalibration = { state.autoCalibration?.takeIf { state.useAutoCalibration && it.converged } },
+                        markerStyle = { state.markerStyle },
+                    )
+                    // Record head poses with the same clock as camera timestamps.
+                    lifecycleScope.launch {
+                        ArDevice.getInstance(s).state.collect { st ->
+                            if (st.trackingState == TrackingState.TRACKING) {
+                                poseHistory.add(SystemClock.elapsedRealtimeNanos(), st.devicePose)
+                            }
+                        }
+                    }
                 }
                 else -> {
                     // Not an XR device (e.g. a phone): detection still works, results are only
@@ -136,7 +168,7 @@ class MainActivity : ComponentActivity() {
                 context = this@MainActivity,
                 lifecycleOwner = this@MainActivity,
                 client = client,
-                headPoseProvider = { if (session == null) Pose.Identity else highlights?.currentHeadPose() },
+                poseHistory = if (session == null) null else poseHistory,
                 onFrameSent = { meta -> pendingFrames[meta.frameId] = meta },
             )
         }
@@ -246,7 +278,28 @@ class MainActivity : ComponentActivity() {
         state.inferMs = state.inferMs * 0.8f + result.inferMs * 0.2f
         state.lastDetections = result.detections
 
-        highlights?.onResult(result, meta)
+        highlights?.onResult(result, meta, state.confidence)
+    }
+
+    private fun handleCalibration(c: AutoCalibration) {
+        val prev = state.autoCalibration
+        // Keep a previously converged (e.g. persisted) result until the new one converges too.
+        if (!c.converged && prev?.converged == true) return
+        state.autoCalibration = c
+        if (c.converged) state.save()
+        // Highlights locked with the old geometry are misplaced: re-detect them.
+        val wasUsed = prev?.converged == true
+        if (c.converged && state.useAutoCalibration && (!wasUsed || significantChange(prev!!, c))) {
+            Log.i(TAG, "auto calibration applied, clearing locked highlights")
+            highlights?.clear()
+        }
+    }
+
+    private fun significantChange(a: AutoCalibration, b: AutoCalibration): Boolean {
+        val dq = a.rotation.inverse * b.rotation
+        val angleDeg = Math.toDegrees(PoseHistory.rotationVector(dq).length.toDouble())
+        val fov = kotlin.math.abs(a.camera.tanHalfH / b.camera.tanHalfH - 1f)
+        return angleDeg > 1.0 || fov > 0.02f
     }
 
     override fun onDestroy() {

@@ -3,6 +3,7 @@ package com.example.xrhighlight
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -16,6 +17,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
@@ -37,6 +39,7 @@ fun ControlPanel(
     onVoiceInput: () -> Unit,
     onClearHighlights: () -> Unit,
     onTestPanel: () -> Unit = {},
+    onResetAutoCalibration: () -> Unit = {},
 ) {
     MaterialTheme(colorScheme = darkColorScheme()) {
         Surface(modifier = Modifier.fillMaxSize()) {
@@ -61,6 +64,17 @@ fun ControlPanel(
                     TextButton(onClick = onTestPanel) { Text("テスト枠") }
                 }
 
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("表示:", modifier = Modifier.padding(end = 8.dp))
+                    for ((style, name) in listOf(MarkerStyle.PIN to "ピン（ラベル＋線）", MarkerStyle.BOX to "枠")) {
+                        val selected = state.markerStyle == style
+                        val onClick = { state.markerStyle = style; state.save() }
+                        if (selected) Button(onClick = onClick) { Text(name) }
+                        else OutlinedButton(onClick = onClick) { Text(name) }
+                        Spacer(Modifier.width(8.dp))
+                    }
+                }
+
                 LabeledSlider(
                     "信頼度しきい値", state.confidence, 0.05f..0.9f, "%.2f",
                 ) { state.confidence = it }
@@ -77,6 +91,7 @@ fun ControlPanel(
                 StatusBlock(state)
 
                 HorizontalDivider()
+                AutoCalibrationBlock(state, onResetAutoCalibration)
                 CalibrationBlock(state)
             }
         }
@@ -109,14 +124,42 @@ private fun StatusBlock(state: AppState) {
 }
 
 @Composable
+private fun AutoCalibrationBlock(state: AppState, onReset: () -> Unit) {
+    val c = state.autoCalibration
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text("自動位置合わせ", style = MaterialTheme.typography.titleSmall)
+        Switch(
+            checked = state.useAutoCalibration,
+            onCheckedChange = { state.useAutoCalibration = it; state.save() },
+            modifier = Modifier.padding(horizontal = 12.dp),
+        )
+        TextButton(onClick = onReset) { Text("やり直す") }
+    }
+    val text = when {
+        c == null -> "データ収集中… 開始後、頭をゆっくり上下左右に動かして周囲を見回してください"
+        !c.converged -> "推定中（%d ペア, 品質 %.2f, 誤差 %.1f px）… 上下にも頭を動かしてください".format(
+            c.pairs, c.quality, c.rmsPx,
+        )
+        else -> "✓ 完了  FOV %.1f°×%.1f° | 角度補正 p%.1f° y%.1f° r%.1f° | 時刻 %+.0f ms | 誤差 %.1f px".format(
+            c.hfovDeg, c.vfovDeg, c.eulerDeg[0], c.eulerDeg[1], c.eulerDeg[2], c.timeOffsetMs, c.rmsPx,
+        )
+    }
+    Text(
+        text,
+        style = MaterialTheme.typography.bodySmall,
+        color = if (c?.converged == true) Color(0xFF66DD88) else Color.Unspecified,
+    )
+}
+
+@Composable
 private fun CalibrationBlock(state: AppState) {
     var expanded by remember { mutableStateOf(false) }
     TextButton(onClick = { expanded = !expanded }) {
-        Text(if (expanded) "▼ キャリブレーション" else "▶ キャリブレーション")
+        Text(if (expanded) "▼ 手動微調整" else "▶ 手動微調整")
     }
     if (!expanded) return
     Text(
-        "ハイライトが実物とずれる場合に調整します。机上の物体を1つ検出させ、枠が重なるように合わせてください。",
+        "自動位置合わせの結果にさらに上乗せする補正です。通常は触らなくて大丈夫です。",
         style = MaterialTheme.typography.bodySmall,
     )
     val c = state.calibration

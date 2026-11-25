@@ -6,6 +6,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import androidx.xr.runtime.math.Quaternion
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -29,6 +30,7 @@ class DetectionClient(
     private val scope: CoroutineScope,
     private val onResult: (DetectionResult) -> Unit,
     private val onStatus: (connected: Boolean, message: String) -> Unit,
+    private val onCalibration: (AutoCalibration) -> Unit = {},
 ) {
     private val http = OkHttpClient.Builder()
         .pingInterval(10, TimeUnit.SECONDS)
@@ -81,8 +83,18 @@ class DetectionClient(
 
     fun releaseSlot() = inFlight.set(false)
 
-    fun sendFrame(frameId: Long, jpeg: ByteArray) {
-        val buf = ByteBuffer.allocate(8 + jpeg.size).putLong(frameId).put(jpeg)
+    fun resetCalibration() {
+        ws?.takeIf { isConnected }?.send(JSONObject().put("type", "calib_reset").toString())
+    }
+
+    /**
+     * Binary frame: [int64 id][uint32 header length][JSON header][JPEG]. The header carries
+     * the head pose at exposure time, which the server uses for auto calibration.
+     */
+    fun sendFrame(frameId: Long, header: JSONObject, jpeg: ByteArray) {
+        val h = header.toString().toByteArray(Charsets.UTF_8)
+        val buf = ByteBuffer.allocate(8 + 4 + h.size + jpeg.size)
+            .putLong(frameId).putInt(h.size).put(h).put(jpeg)
         val ok = ws?.send(buf.array().toByteString()) ?: false
         if (!ok) releaseSlot()
     }
@@ -132,6 +144,7 @@ class DetectionClient(
                         onResult(parseResult(json))
                     }
                     "config_ack" -> Log.i(TAG, "server labels: ${json.optJSONArray("labels")}")
+                    "calibration" -> onCalibration(parseCalibration(json))
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "bad message: $text", e)
@@ -171,6 +184,33 @@ class DetectionClient(
             frameId = json.getLong("frame_id"),
             inferMs = json.optDouble("infer_ms", 0.0).toFloat(),
             detections = dets,
+        )
+    }
+
+    private fun parseCalibration(j: JSONObject): AutoCalibration {
+        val q = j.getJSONArray("q")
+        val e = j.getJSONArray("euler_deg")
+        return AutoCalibration(
+            rotation = Quaternion(
+                q.getDouble(0).toFloat(), q.getDouble(1).toFloat(),
+                q.getDouble(2).toFloat(), q.getDouble(3).toFloat(),
+            ),
+            camera = CameraModel(
+                tanHalfH = j.getDouble("tan_h").toFloat(),
+                tanHalfV = j.getDouble("tan_v").toFloat(),
+                cx = j.getDouble("cx").toFloat(),
+                cy = j.getDouble("cy").toFloat(),
+                k1 = j.optDouble("k1", 0.0).toFloat(),
+                k2 = j.optDouble("k2", 0.0).toFloat(),
+            ),
+            timeOffsetMs = j.getDouble("dt_ms").toFloat(),
+            rmsPx = j.getDouble("rms_px").toFloat(),
+            pairs = j.getInt("pairs"),
+            quality = j.getDouble("quality").toFloat(),
+            converged = j.getBoolean("converged"),
+            eulerDeg = (0 until e.length()).map { e.getDouble(it).toFloat() },
+            hfovDeg = j.getDouble("hfov_deg").toFloat(),
+            vfovDeg = j.getDouble("vfov_deg").toFloat(),
         )
     }
 
