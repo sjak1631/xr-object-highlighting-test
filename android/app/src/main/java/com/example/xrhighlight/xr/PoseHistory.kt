@@ -1,4 +1,4 @@
-package com.example.xrhighlight
+package com.example.xrhighlight.xr
 
 import androidx.xr.runtime.math.Pose
 import androidx.xr.runtime.math.Quaternion

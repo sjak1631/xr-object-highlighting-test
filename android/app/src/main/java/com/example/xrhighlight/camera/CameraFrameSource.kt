@@ -1,4 +1,4 @@
-package com.example.xrhighlight
+package com.example.xrhighlight.camera
 
 import android.annotation.SuppressLint
 import android.content.Context
@@ -20,14 +20,15 @@ import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleOwner
 import androidx.xr.runtime.math.Pose
+import com.example.xrhighlight.geometry.CameraModel
+import com.example.xrhighlight.net.DetectionClient
+import com.example.xrhighlight.xr.PoseHistory
 import androidx.xr.runtime.math.Vector3
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.Executors
-import kotlin.math.atan
 import kotlin.math.max
-import kotlin.math.tan
 
 /**
  * Pulls frames from the world-facing camera with CameraX, tags each with the head pose at capture
@@ -42,6 +43,8 @@ class CameraFrameSource(
     /** Head pose history (perception space); null = no XR tracking (2D test mode). */
     private val poseHistory: PoseHistory?,
     private val onFrameSent: (FrameMeta) -> Unit,
+    /** Optional access to the raw RGBA frame (before it is closed), e.g. for experiments. */
+    private val rawFrameSink: ((Long, ImageProxy) -> Unit)? = null,
     private val maxWidth: Int = 640,
     private val jpegQuality: Int = 75,
 ) {
@@ -185,6 +188,7 @@ class CameraFrameSource(
                 .put("q", JSONArray(listOf(pose.rotation.x, pose.rotation.y, pose.rotation.z, pose.rotation.w).map { it.toDouble() }))
                 .put("p", JSONArray(listOf(pose.translation.x, pose.translation.y, pose.translation.z).map { it.toDouble() }))
                 .put("w", JSONArray(listOf(angVel.x, angVel.y, angVel.z).map { it.toDouble() }))
+            rawFrameSink?.invoke(id, image)
             client.sendFrame(id, header, jpeg)
         } catch (e: Exception) {
             Log.w(TAG, "analyze failed", e)
@@ -196,9 +200,5 @@ class CameraFrameSource(
 
     companion object {
         private const val TAG = "CameraFrameSource"
-
-        fun fovDegrees(tanHalf: Float): Float = Math.toDegrees(2.0 * atan(tanHalf.toDouble())).toFloat()
-
-        fun tanHalfFromDegrees(deg: Float): Float = tan(Math.toRadians(deg / 2.0)).toFloat()
     }
 }

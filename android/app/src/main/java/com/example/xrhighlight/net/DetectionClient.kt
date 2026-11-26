@@ -1,4 +1,4 @@
-package com.example.xrhighlight
+package com.example.xrhighlight.net
 
 import android.os.SystemClock
 import android.util.Log
@@ -6,7 +6,9 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import androidx.xr.runtime.math.Quaternion
+import com.example.xrhighlight.Detection
+import com.example.xrhighlight.DetectionResult
+import com.example.xrhighlight.geometry.AutoCalibration
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -144,7 +146,7 @@ class DetectionClient(
                         onResult(parseResult(json))
                     }
                     "config_ack" -> Log.i(TAG, "server labels: ${json.optJSONArray("labels")}")
-                    "calibration" -> onCalibration(parseCalibration(json))
+                    "calibration" -> onCalibration(AutoCalibration.fromJson(json))
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "bad message: $text", e)
@@ -184,33 +186,6 @@ class DetectionClient(
             frameId = json.getLong("frame_id"),
             inferMs = json.optDouble("infer_ms", 0.0).toFloat(),
             detections = dets,
-        )
-    }
-
-    private fun parseCalibration(j: JSONObject): AutoCalibration {
-        val q = j.getJSONArray("q")
-        val e = j.getJSONArray("euler_deg")
-        return AutoCalibration(
-            rotation = Quaternion(
-                q.getDouble(0).toFloat(), q.getDouble(1).toFloat(),
-                q.getDouble(2).toFloat(), q.getDouble(3).toFloat(),
-            ),
-            camera = CameraModel(
-                tanHalfH = j.getDouble("tan_h").toFloat(),
-                tanHalfV = j.getDouble("tan_v").toFloat(),
-                cx = j.getDouble("cx").toFloat(),
-                cy = j.getDouble("cy").toFloat(),
-                k1 = j.optDouble("k1", 0.0).toFloat(),
-                k2 = j.optDouble("k2", 0.0).toFloat(),
-            ),
-            timeOffsetMs = j.getDouble("dt_ms").toFloat(),
-            rmsPx = j.getDouble("rms_px").toFloat(),
-            pairs = j.getInt("pairs"),
-            quality = j.getDouble("quality").toFloat(),
-            converged = j.getBoolean("converged"),
-            eulerDeg = (0 until e.length()).map { e.getDouble(it).toFloat() },
-            hfovDeg = j.getDouble("hfov_deg").toFloat(),
-            vfovDeg = j.getDouble("vfov_deg").toFloat(),
         )
     }
 

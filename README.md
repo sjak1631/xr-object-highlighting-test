@@ -1,31 +1,39 @@
 # XR Object Highlighter (XREAL Aura / Android XR)
 
-XREAL Aura の前方カメラ映像から、**指定した任意のラベル**に該当する物体をすべて検出し、ワールド固定の枠でリアルタイムにハイライトします。
+XREAL Aura の前方カメラ映像から、**指定した任意のラベル**に該当する物体をすべて検出し、空間に固定したピン（物体の上の印＋線＋ラベル）でリアルタイムに示します。
 
-- ラベルは自由記述（`cup, red backpack, person wearing glasses` など）。パネルの入力欄か音声入力で指定
+- ラベルは自由記述（`cup, red backpack` など）。パネルの入力欄か音声入力で指定
 - 検出はオープンボキャブラリ型モデル（YOLO-World / YOLOE）を使うため、固定クラスに縛られない
 - よく使う日本語ラベル（コップ、椅子、スマホなど）はサーバー側で英語に変換（[server/aliases.py](server/aliases.py)）
 
-## 構成
+## 仕組み
 
 ```
-┌──────── XREAL Aura（Android XR アプリ）──────┐          ┌──── PC（GPU 推奨）──────────┐
-│ CameraX → JPEG 640px ＋ 撮影時の頭部姿勢     │ ─ WS ──▶ │ server.py                    │
-│                                             │          │  YOLO-World / YOLOE          │
-│ HighlightController                         │ ◀─ WS ── │  set_classes(labels)         │
-│  撮影時の姿勢でボックス中心からレイを作成   │  boxes   └──────────────────────────────┘
-│  → ARCore hitTest（平面・深度）で距離を推定 │
-│  → ラベル＋角度で追跡・平滑化               │
-│  → PanelEntity（発光枠）をワールド固定配置  │
-└─────────────────────────────────────────────┘
+Aura ─ camera ──frame + 撮影時の頭部姿勢──▶ PC: server.py（YOLO-World 検出 ＋ 自動キャリブレーション）
+                                                  │ boxes / calibration
+  ┌───────────────────────────────────────────────┘
+  ▼
+locate   箱 → 空間の視線（レイ）＋距離の手がかり        RayObjectLocator
+tracking 複数回の観測 → 安定した物体（固定・移動・削除）  ObjectTracker
+render   物体ごとのピンを毎フレーム描画                  PinRenderer
 ```
 
-設計のポイント:
+1. **位置推定（locate）**: 撮影した瞬間の頭部姿勢（姿勢履歴から補間）とカメラの補正値から、箱の中心を通る視線を作ります。距離は ARCore のヒットテストで推定します（箱の下端の視線が机・床に当たる点を優先）。
+2. **追跡（tracking）**
+   - 3 回続けて見えた物体を、三角測量した位置でアンカーに固定します。その後の検出は確認と位置の微修正だけに使うので、揺れません。
+   - 固定位置から明らかにずれて見えたら「移動中」として追いかけ、止まったら固定し直します。
+   - 見えるはずなのに検出されない物体は消し、同じラベルの重複はまとめます。
+3. **表示（render）**: ピンは常にユーザーの方を向き、距離によらず同じ大きさに見えます。動きは補間し、出現・消滅はフェードします。Aura は加算合成のディスプレイ（黒が透明）なので、明るい線だけで描いています。
 
-- **遅延補償**: 各フレームに撮影時の頭部姿勢を付け、その姿勢で 3D 位置を復元します。推論中に頭が動いても、ハイライトは物体の実際の位置に出ます。
-- **Stop-and-wait 送信**: 前のフレームの結果が届いてから次を送るので、ネットワークが遅くても遅延が積み上がりません。
-- **ワールド固定表示**: ハイライトは SceneCore の `PanelEntity` として 3D 空間に置き、毎フレームユーザーの方へ向けます。視野から外れた物体も最大 10 秒は残るため、見回して戻ってもハイライトが付いたままです。
-- **光学シースルー向け描画**: Aura のディスプレイは加算合成（黒が透明）なので、明るい線と薄い色だけで描きます。
+### 自動キャリブレーション
+
+Aura の Camera2 メタデータは仮の値で、実際より視野角が約 14° 広く申告されます。そこで [server/calibration.py](server/calibration.py) が、頭を回したときの「頭部トラッキングの回転」と「画像上の特徴点の動き」を突き合わせ、次の値を推定します。
+
+- 視野角、光学中心、レンズ歪み
+- 頭に対するカメラの取り付け角度
+- 映像と姿勢の時刻ずれ
+
+推定値は端末に保存され、次回以降も使われます。やり直すときはパネルの「やり直す」を押してください。
 
 ## ディレクトリ
 
@@ -33,10 +41,18 @@ XREAL Aura の前方カメラ映像から、**指定した任意のラベル**�
 |---|---|
 | [server/server.py](server/server.py) | WebSocket 推論サーバー（FastAPI） |
 | [server/detector.py](server/detector.py) | YOLO-World / YOLOE のラッパー（実行中にラベル変更可） |
+| [server/calibration.py](server/calibration.py) | カメラの自動キャリブレーション |
 | [server/webcam_demo.py](server/webcam_demo.py) | グラスなしで PC の Web カメラで試すクライアント |
-| [android/](android/) | Android XR アプリ（Kotlin、Jetpack XR SceneCore / ARCore、CameraX、Compose） |
-| […/HighlightController.kt](android/app/src/main/java/com/example/xrhighlight/HighlightController.kt) | 2D → 3D 変換、追跡、パネル配置 |
-| […/CameraFrameSource.kt](android/app/src/main/java/com/example/xrhighlight/CameraFrameSource.kt) | カメラ取得、FOV 推定、フレーム送信 |
+| `android/…/xrhighlight/` | Android XR アプリ（Kotlin、Jetpack XR、CameraX、Compose） |
+| 　[MainActivity.kt](android/app/src/main/java/com/example/xrhighlight/MainActivity.kt) | 全体の配線（UI・カメラ・通信・位置推定・追跡・描画） |
+| 　[xr/](android/app/src/main/java/com/example/xrhighlight/xr/) | XR セッション（Full Space・トラッキング設定）、頭部姿勢の履歴 |
+| 　[camera/](android/app/src/main/java/com/example/xrhighlight/camera/) | カメラ取得、撮影時の姿勢を付けてフレーム送信 |
+| 　[net/](android/app/src/main/java/com/example/xrhighlight/net/) | サーバーとの WebSocket 通信 |
+| 　[geometry/](android/app/src/main/java/com/example/xrhighlight/geometry/) | カメラモデル、キャリブレーション結果、ベクトル計算 |
+| 　[locate/](android/app/src/main/java/com/example/xrhighlight/locate/) | 箱 → 空間（`ObjectLocator` インターフェースと実装、空間アノテーションの検証コード） |
+| 　[tracking/](android/app/src/main/java/com/example/xrhighlight/tracking/) | 物体の追跡（固定・移動・存在判定・重複統合・三角測量） |
+| 　[render/](android/app/src/main/java/com/example/xrhighlight/render/) | ピンの描画 |
+| 　[ui/](android/app/src/main/java/com/example/xrhighlight/ui/) | 操作パネル |
 
 ## 1. 推論サーバー（PC）
 
@@ -47,64 +63,57 @@ python -m venv .venv
 # NVIDIA GPU がある場合は、先に CUDA 版 torch を入れる（pytorch.org 参照）
 pip install -r requirements.txt
 
-python server.py --model yolov8m-worldv2.pt --port 8765
+python server.py --model yolov8s-worldv2.pt --port 8765 --host 127.0.0.1
 ```
 
 - モデルは `yolov8{s,m,l,x}-worldv2.pt`（YOLO-World）か `yoloe-11{s,m,l}-seg.pt`（YOLOE）。初回起動時に自動でダウンロードされます（CLIP テキストエンコーダも約 340 MB 追加）。
-- 参考値: このマシンの CPU で `yolov8s-worldv2` を使うと 1 フレーム約 80〜150 ms。リアルタイムで使うなら GPU 推奨です。
-- ラベルの切り替えは初回約 2 秒かかり、以降はキャッシュされます。
+- 参考値: このマシンの CPU で `yolov8s-worldv2` を使うと 1 フレーム約 80〜140 ms。GPU を使えばもっと速くなります。
 
 グラスなしでの動作確認:
 
 ```bash
 python webcam_demo.py --server ws://localhost:8765/ws --labels "cup, bottle, person"
-# ウィンドウで l キー → ターミナルで新しいラベルを入力、q で終了
 ```
 
 ## 2. Android XR アプリ（XREAL Aura）
 
-必要なもの: Android Studio（または JDK 17 ＋ Android SDK API 37）、adb で接続した XREAL Aura。
+必要なもの: JDK 17 ＋ Android SDK（API 37）、adb で接続した XREAL Aura（ワイヤレスデバッグ可）。
 
 ```bash
 cd android
-./gradlew assembleDebug           # → app/build/outputs/apk/debug/app-debug.apk
-adb install -r app/build/outputs/apk/debug/app-debug.apk
+./gradlew assembleDebug
+adb install -r -g app/build/outputs/apk/debug/app-debug.apk
+adb reverse tcp:8765 tcp:8765      # Aura の 127.0.0.1:8765 → PC のサーバー（ファイアウォール設定不要）
 ```
 
 使い方:
 
-1. 起動時にカメラ・頭部トラッキング・シーン理解の権限を許可します。
-2. 「推論サーバー」に PC の IP を入力します（例: `ws://192.168.0.10:8765/ws`）。PC と Aura は同じネットワークに置き、ファイアウォールでポート 8765 を許可してください。
-3. ラベル（例: `コップ, keyboard, スマホ`）を入力するか「🎤 音声で指定」を使い、「開始」を押します。
+1. 「推論サーバー」が `ws://127.0.0.1:8765/ws` になっていることを確認します（`adb reverse` を使う場合）。
+2. ラベル（例: `コップ, keyboard`）を入力するか「🎤 音声で指定」を使い、「開始」を押します。
+3. 初回は頭をゆっくり上下左右に動かして周囲を見回すと、自動キャリブレーションが完了します（パネルに「✓ 完了」と表示）。
 4. 実行中にラベルを変えるときは「ラベル適用」を押します。
 
-普通のスマホでも動きますが、XR がない環境ではハイライトは描かれず、検出結果の一覧だけが出ます（接続確認用）。
-
-## 3. キャリブレーション
-
-Android XR の API からは、頭部姿勢に対する RGB カメラの正確な位置・角度が直接取れません。アプリは「カメラ＝頭部姿勢」と仮定しているため、少しずれることがあります。
-机の上の物体を 1 つ検出させ、「キャリブレーション」のスライダーで枠が実物に重なるよう調整してください。
-
-- **Yaw / Pitch / Roll**: カメラ光軸の角度ずれ（枠が常に左右・上下にずれるとき）
-- **FOV スケール**: 視野角推定の補正（視野の端ほどずれが大きいとき）
-- **カメラ位置 X / Y**: カメラ位置のオフセット（近くの物体で効く）
-- **既定距離**: ヒットテストで面が見つからないときに使う距離（宙に浮いた物体など）
-
-設定は端末に保存されます。
+普通のスマホでも動きますが、XR がない環境ではピンは描かれず、検出結果の一覧だけが出ます（接続確認用）。
 
 ## 通信プロトコル
 
 ```
 client → server  text   {"type":"config","labels":["cup","bottle"],"conf":0.25}
-client → server  binary [int64 big-endian frame_id][JPEG]
+client → server  text   {"type":"calib_reset"}
+client → server  binary [int64 frame_id][uint32 header_len][JSON header][JPEG]
+                        header = {"ts": ns, "q": [x,y,z,w], "p": [x,y,z], "w": [wx,wy,wz]}  // 撮影時の頭部姿勢と角速度
 server → client  text   {"type":"detections","frame_id":1,"infer_ms":18.2,"width":640,"height":480,
                          "detections":[{"label":"cup","score":0.81,"box":[x1,y1,x2,y2]}]}  // box は 0..1
+server → client  text   {"type":"calibration","q":[...],"tan_h":..,"tan_v":..,"cx":..,"cy":..,"k1":..,"k2":..,
+                         "dt_ms":..,"rms_px":..,"pairs":..,"quality":..,"converged":true, ...}
 ```
 
 ## 既知の制約と今後
 
-- **実機では未検証です。** 確認済み: `./gradlew assembleDebug` のビルド成功、アプリと同じプロトコルを使ったテスト画像でのサーバー通し動作（日本語ラベルを含む）。Aura 実機での確認が必要なもの: CameraX から前方カメラを取得できるか、ヒットテストとパネル配置が期待どおり動くか。
-- Jetpack XR はアルファ版です（`runtime 1.1.0-alpha03`、`scenecore/arcore 1.1.0-alpha02`）。API が変わる可能性があります。
-- 距離は平面・深度へのヒットテストで決めています。壁の手前に浮いた小物は壁の深さに置かれることがあります。`Depth.mono(session)` でボックス中心の深度を直接取ると改善できます。
-- ハイライトは矩形です。YOLOE の `-seg` モデルならマスクも得られるので、輪郭表示にもできます。
-- サーバーなしで動かしたい場合は、YOLO-World を固定クラスで TFLite に書き出してオンデバイス推論する方法があります（ラベルを変えるたびに書き出し直しが必要）。
+- Jetpack XR はアルファ版です（`runtime 1.1.0-alpha03`、`scenecore/arcore 1.1.0-alpha02`）。
+- 起動モードは `XR_ACTIVITY_START_MODE_FULL_SPACE_MANAGED` にしてください。`UNMANAGED` では SceneCore のパネルが表示されません。
+- **空間アノテーション（システム側での 3D 追跡）**: Aura のシステムには追跡サービスが入っていますが、ビルド `UXP4.261012.001.O5` ではアプリ向けの OpenXR 拡張 `ANDROID_spatial_annotation_tracking` が公開されていないため使えません。使えるようになれば、`ObjectLocator` を差し替えるだけで、自前のキャリブレーションと距離推定が不要になります。
+  - 開発者側の条件（Spatial API レベル 3 以上：実機は 4、`SCENE_UNDERSTANDING_FINE` 権限、`arcore` 1.1.0-alpha01 以上と `@OptIn`）はすべて満たしています。
+  - 使えない原因は、ランタイムがこの拡張を一覧に出していないことです。ランタイムを解析すると、内部の展開用フラグ `com.android.xr.flags.enable_oxr_android_spatial_extensions`（名前空間 `com_android_xr`）がこのビルドではオフになっていました。製品版ビルドではこのフラグを変更できないため、システム更新（OTA）で有効になるのを待つ必要があります。
+- 距離推定の改善案: システムの深度マップ（`Depth` ＋ `RenderViewpoint`）を使う。
+- 対象物が決まっている実験では、小型の検出モデルをファインチューンし、端末上で推論するのが速くて正確です。
